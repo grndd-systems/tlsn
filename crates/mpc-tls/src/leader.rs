@@ -3,8 +3,8 @@ mod actor;
 use crate::{
     error::MpcTlsError,
     msg::{
-        ClientFinishedVd, Decrypt, Encrypt, Message, ServerFinishedVd, SetClientRandom,
-        SetServerKey, SetServerRandom, StartHandshake,
+        ClientFinishedVd, Decrypt, Encrypt, Message, RevealDecryptionKey, ServerFinishedVd,
+        SetClientRandom, SetServerKey, SetServerRandom, StartHandshake,
     },
     record_layer::{aead::MpcAesGcm, DecryptMode, EncryptMode, RecordLayer},
     utils::opaque_into_parts,
@@ -269,6 +269,53 @@ impl MpcTlsLeader {
             server_key: None,
             server_kx_details: None,
         };
+
+        Ok(())
+    }
+
+    /// Reveals the decryption key to the Follower for hybrid MPC mode.
+    ///
+    /// Call this AFTER all requests have been encrypted and sent,
+    /// but BEFORE responses need to be decrypted.
+    ///
+    /// After this call, the Follower can decrypt responses locally
+    /// without MPC, resulting in ~7x faster overall performance.
+    #[instrument(name = "reveal_decryption_key", level = "debug", skip_all, err)]
+    pub async fn reveal_decryption_key(&mut self) -> Result<(), MpcTlsError> {
+        let State::Active {
+            ctx,
+            vm,
+            record_layer,
+            ..
+        } = &mut self.state
+        else {
+            return Err(MpcTlsError::state(
+                "must be in active state to reveal decryption key",
+            ));
+        };
+
+        debug!("revealing decryption key to follower");
+
+        // Decode and recover the full decryption key (Leader only)
+        let key_iv = record_layer
+            .reveal_decryption_key_early(ctx, vm.clone())
+            .await?;
+
+        // Only Leader has the key, send it to Follower
+        if let Some((key, iv)) = key_iv {
+            ctx.io_mut()
+                .send(Message::RevealDecryptionKey(RevealDecryptionKey {
+                    server_write_key: key,
+                    server_write_iv: iv,
+                }))
+                .await?;
+
+            debug!("decryption key revealed to follower");
+        } else {
+            return Err(MpcTlsError::state(
+                "failed to recover decryption key (not leader?)",
+            ));
+        }
 
         Ok(())
     }

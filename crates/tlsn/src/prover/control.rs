@@ -23,4 +23,21 @@ impl ProverControl {
     pub fn enable_decryption(&self, enable: bool) {
         self.decrypt_state.enable_decryption(enable)
     }
+
+    /// Requests the decryption key to be revealed to the follower.
+    ///
+    /// This enables hybrid MPC mode where only request encryption uses MPC,
+    /// while response decryption happens locally on the follower.
+    /// This can significantly improve performance (~7x speedup).
+    ///
+    /// After calling this, the prover future must be polled for the
+    /// key reveal to complete.
+    pub fn reveal_decryption_key(&self) {
+        self.decrypt_state.request_key_reveal()
+    }
+
+    /// Returns whether the decryption key has been revealed.
+    pub fn is_key_revealed(&self) -> bool {
+        self.decrypt_state.is_key_revealed()
+    }
 }

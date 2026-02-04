@@ -20,6 +20,9 @@ pub(crate) enum Message {
     StartTraffic,
     Flush { is_decrypting: bool },
     CloseConnection,
+    /// Leader reveals the full decryption key to Follower.
+    /// This enables Follower to decrypt responses locally (hybrid MPC mode).
+    RevealDecryptionKey(RevealDecryptionKey),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,3 +77,13 @@ pub(crate) struct ServerFinishedVd {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub(crate) struct CloseConnection;
+
+/// Message sent by Leader to reveal the full decryption key to Follower.
+/// After receiving this, Follower can decrypt TLS responses locally.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RevealDecryptionKey {
+    /// Full server_write_key (AES-128 key for decrypting server responses)
+    pub server_write_key: [u8; 16],
+    /// Full server_write_iv (implicit nonce for AES-GCM)
+    pub server_write_iv: [u8; 4],
+}

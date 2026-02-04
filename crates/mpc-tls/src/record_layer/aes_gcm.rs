@@ -178,6 +178,25 @@ impl AesGcm {
         Ok(())
     }
 
+    /// Returns the full decryption key if available.
+    /// Only the Leader will have the key after `finish_decode()`.
+    pub(crate) fn get_key(&self) -> Result<([u8; 16], [u8; 4]), MpcTlsError> {
+        let State::Ready { key, iv } = &self.state else {
+            return Err(MpcTlsError::record_layer(
+                "aes-gcm must be in ready state to get key",
+            ));
+        };
+
+        let key = key.ok_or_else(|| {
+            MpcTlsError::record_layer("key not available (not leader or not decoded)")
+        })?;
+        let iv = iv.ok_or_else(|| {
+            MpcTlsError::record_layer("iv not available (not leader or not decoded)")
+        })?;
+
+        Ok((key, iv))
+    }
+
     pub(crate) fn decrypt(
         &mut self,
         explicit_nonce: Vec<u8>,
@@ -260,5 +279,86 @@ mod tests {
             .unwrap();
 
         assert_eq!(msg, decrypted.as_slice());
+    }
+
+    /// Test hybrid MPC mode: Leader retrieves key and "sends" to Follower for local decryption.
+    /// This simulates the key reveal mechanism for hybrid MPC.
+    #[test]
+    fn test_hybrid_mpc_key_reveal() {
+        let key = [0x42u8; 16];
+        let iv = [0x13u8; 4];
+        let explicit_nonce = [0xABu8; 8];
+        let aad = [0xCDu8; 13];
+
+        // Simulate Leader in Ready state with the key
+        let mut leader_aes = AesGcm::new(Role::Leader);
+        leader_aes.state = State::Ready {
+            key: Some(key),
+            iv: Some(iv),
+        };
+
+        // Leader retrieves the key using get_key()
+        let (revealed_key, revealed_iv) = leader_aes.get_key().expect("Leader should have key");
+
+        assert_eq!(revealed_key, key, "Revealed key should match original");
+        assert_eq!(revealed_iv, iv, "Revealed IV should match original");
+
+        // Simulate the key being "sent" to Follower (in real code this goes through RevealDecryptionKey message)
+
+        // Create a ciphertext that both Leader and Follower should be able to decrypt
+        let mut nonce = [0u8; 12];
+        nonce[..4].copy_from_slice(&iv);
+        nonce[4..].copy_from_slice(&explicit_nonce);
+
+        let msg = b"hybrid mpc test message";
+        let mut aes_gcm = Aes128Gcm::new(&key.into());
+        let mut ciphertext = msg.to_vec();
+        let tag = aes_gcm
+            .encrypt_in_place_detached(&nonce.into(), &aad, &mut ciphertext)
+            .unwrap();
+
+        // Leader decrypts using its internal state
+        let decrypted_by_leader = leader_aes
+            .decrypt(
+                explicit_nonce.to_vec(),
+                aad.to_vec(),
+                ciphertext.clone(),
+                tag.to_vec(),
+            )
+            .expect("Leader should decrypt successfully");
+        assert_eq!(msg.as_slice(), decrypted_by_leader.as_slice());
+
+        // Simulate Follower receiving the key and decrypting locally
+        // (In real code, Follower uses Aes128Gcm directly after receiving RevealDecryptionKey)
+        let mut follower_aes = Aes128Gcm::new(&revealed_key.into());
+        let mut follower_ciphertext = ciphertext.clone();
+        follower_aes
+            .decrypt_in_place_detached(
+                (&nonce).into(),
+                &aad,
+                &mut follower_ciphertext,
+                tag.as_slice().into(),
+            )
+            .expect("Follower should decrypt successfully with revealed key");
+
+        assert_eq!(msg.as_slice(), follower_ciphertext.as_slice());
+    }
+
+    /// Test that Follower cannot call get_key() (returns error)
+    #[test]
+    fn test_follower_cannot_get_key() {
+        let follower_aes = AesGcm::new(Role::Follower);
+        // Follower in Init state cannot get key
+        assert!(follower_aes.get_key().is_err());
+    }
+
+    /// Test that get_key() requires Ready state
+    #[test]
+    fn test_get_key_requires_ready_state() {
+        let aes = AesGcm::new(Role::Leader);
+        // Leader in Init state cannot get key
+        let result = aes.get_key();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("ready state"));
     }
 }

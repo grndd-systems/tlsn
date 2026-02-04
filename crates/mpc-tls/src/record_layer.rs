@@ -97,6 +97,10 @@ pub(crate) struct RecordLayer {
     decrypt_buffer: Vec<DecryptOp>,
     encrypted_buffer: VecDeque<EncryptedRecord>,
     decrypted_buffer: VecDeque<PlainRecord>,
+
+    /// Whether local decryption is enabled (hybrid MPC mode).
+    /// When true, the Leader has revealed the decryption key to the Follower.
+    local_decryption_enabled: bool,
 }
 
 impl RecordLayer {
@@ -121,6 +125,7 @@ impl RecordLayer {
             decrypt_buffer: Vec::new(),
             encrypted_buffer: VecDeque::new(),
             decrypted_buffer: VecDeque::new(),
+            local_decryption_enabled: false,
         }
     }
 
@@ -514,6 +519,53 @@ impl RecordLayer {
         }
 
         Ok(())
+    }
+
+    /// Reveals the decryption key early (before commit) for hybrid MPC mode.
+    /// After this call, the Leader can retrieve the full decryption key.
+    ///
+    /// Returns the full (server_write_key, server_write_iv) for the Leader.
+    /// Follower will get (None, None) - they receive the key via message.
+    pub(crate) async fn reveal_decryption_key_early(
+        &mut self,
+        ctx: &mut Context,
+        vm: Vm,
+    ) -> Result<Option<([u8; 16], [u8; 4])>, MpcTlsError> {
+        let State::Online { .. } = &self.state else {
+            return Err(MpcTlsError::state(
+                "record layer must be in online state to reveal decryption key",
+            ));
+        };
+
+        let mut vm = vm
+            .try_lock_owned()
+            .map_err(|_| MpcTlsError::record_layer("VM lock is held"))?;
+
+        // Trigger key decode in MPC VM (same as in commit)
+        self.aes_gcm.decode_key(&mut (*vm))?;
+        vm.flush(ctx).await.map_err(MpcTlsError::record_layer)?;
+        self.aes_gcm.finish_decode()?;
+
+        // Enable local decryption mode
+        self.local_decryption_enabled = true;
+
+        // Leader gets the key, Follower gets None
+        match self.aes_gcm.get_key() {
+            Ok((key, iv)) => Ok(Some((key, iv))),
+            Err(_) => Ok(None), // Follower doesn't have the key
+        }
+    }
+
+    /// Enables local decryption mode for the Follower.
+    /// Called when Follower receives the decryption key from Leader.
+    pub(crate) fn enable_local_decryption(&mut self) -> Result<(), MpcTlsError> {
+        self.local_decryption_enabled = true;
+        Ok(())
+    }
+
+    /// Returns whether local decryption is enabled.
+    pub(crate) fn is_local_decryption_enabled(&self) -> bool {
+        self.local_decryption_enabled
     }
 
     /// Commits to the record layer, returning a transcript in which the

@@ -60,6 +60,10 @@ pub(crate) trait TlsClient {
 #[derive(Debug)]
 pub(crate) struct DecryptState {
     decrypt: AtomicBool,
+    /// Flag to request key reveal for hybrid MPC mode.
+    reveal_key_requested: AtomicBool,
+    /// Flag indicating key has been revealed.
+    key_revealed: AtomicBool,
 }
 
 impl DecryptState {
@@ -69,6 +73,27 @@ impl DecryptState {
 
     pub(crate) fn is_decrypting(&self) -> bool {
         self.decrypt.load(Ordering::Acquire)
+    }
+
+    /// Requests the decryption key to be revealed to the follower.
+    /// After this, the follower can decrypt server responses locally.
+    pub(crate) fn request_key_reveal(&self) {
+        self.reveal_key_requested.store(true, Ordering::Release);
+    }
+
+    /// Checks if key reveal has been requested (and clears the flag).
+    pub(crate) fn take_reveal_request(&self) -> bool {
+        self.reveal_key_requested.swap(false, Ordering::AcqRel)
+    }
+
+    /// Marks the key as revealed.
+    pub(crate) fn mark_key_revealed(&self) {
+        self.key_revealed.store(true, Ordering::Release);
+    }
+
+    /// Returns true if the key has been revealed.
+    pub(crate) fn is_key_revealed(&self) -> bool {
+        self.key_revealed.load(Ordering::Acquire)
     }
 }
 

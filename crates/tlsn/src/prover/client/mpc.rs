@@ -86,10 +86,13 @@ impl MpcTlsClient {
             client_closed: false,
             mpc_stopped: false,
             decrypt,
+            key_revealed: false,
         };
 
         let decrypt = DecryptState {
             decrypt: AtomicBool::new(decrypt),
+            reveal_key_requested: AtomicBool::new(false),
+            key_revealed: AtomicBool::new(false),
         };
 
         Self {
@@ -226,6 +229,7 @@ impl TlsClient for MpcTlsClient {
             State::Active { mpc, inner } => {
                 trace!("inner client is active");
                 let decrypt = self.decrypt.is_decrypting();
+                let reveal_key_requested = self.decrypt.take_reveal_request();
 
                 if !inner.tls.is_handshaking() {
                     if self.server_closed {
@@ -237,6 +241,19 @@ impl TlsClient for MpcTlsClient {
                         self.state = State::Busy {
                             mpc,
                             fut: Box::pin(inner.client_close()),
+                        };
+                    } else if reveal_key_requested && !inner.key_revealed {
+                        // Handle key reveal request for hybrid MPC mode
+                        let decrypt_state = self.decrypt.clone();
+                        self.state = State::Busy {
+                            mpc,
+                            fut: Box::pin(async move {
+                                let result = inner.reveal_decryption_key().await;
+                                if result.is_ok() {
+                                    decrypt_state.mark_key_revealed();
+                                }
+                                result
+                            }),
                         };
                     } else if decrypt != inner.decrypt {
                         self.state = State::Busy {
@@ -379,6 +396,8 @@ struct InnerState {
     decrypt: bool,
     client_closed: bool,
     mpc_stopped: bool,
+    /// Whether decryption key has been revealed for hybrid MPC mode.
+    key_revealed: bool,
 }
 
 impl InnerState {
@@ -407,6 +426,19 @@ impl InnerState {
             .await
             .map_err(|err| TlsnError::internal().with_source(err))?;
         self.decrypt = enable;
+        self.run().await
+    }
+
+    /// Reveals the decryption key to the follower for hybrid MPC mode.
+    #[instrument(parent = &self.span, level = "debug", skip_all, err)]
+    async fn reveal_decryption_key(mut self: Box<Self>) -> Result<Box<Self>, TlsnError> {
+        debug!("revealing decryption key to follower for hybrid MPC mode");
+        self.mpc_ctrl
+            .reveal_decryption_key()
+            .await
+            .map_err(|err| TlsnError::internal().with_source(err))?;
+        self.key_revealed = true;
+        debug!("decryption key revealed successfully");
         self.run().await
     }
 

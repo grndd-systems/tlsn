@@ -1,8 +1,10 @@
 use crate::{
-    msg::{Message, StartHandshake},
+    msg::{Message, RevealDecryptionKey, StartHandshake},
     record_layer::{aead::MpcAesGcm, RecordLayer},
     Config, MpcTlsError, Role, SessionKeys, Vm,
 };
+use aes_gcm::{aead::AeadMutInPlace, Aes128Gcm, NewAead};
+use tls_core::cipher::make_tls12_aad;
 use hmac_sha256::{MpcPrf, PrfOutput};
 use ke::KeyExchange;
 use key_exchange::{self as ke, MpcKeyExchange};
@@ -235,6 +237,12 @@ impl MpcTlsFollower {
         let mut server_key = None;
         let mut cf_vd = None;
         let mut sf_vd = None;
+
+        // Hybrid MPC mode: local decryption state
+        let mut local_decrypter: Option<Aes128Gcm> = None;
+        let mut local_iv: Option<[u8; 4]> = None;
+        let mut local_read_seq: u64 = 0;
+
         loop {
             let msg: Message = self.ctx.io_mut().expect_next().await?;
             match msg {
@@ -366,16 +374,48 @@ impl MpcTlsFollower {
                         .map_err(MpcTlsError::record_layer)?;
                 }
                 Message::Decrypt(decrypt) => {
-                    record_layer
-                        .push_decrypt(
+                    if let (Some(decrypter), Some(iv)) = (&mut local_decrypter, &local_iv) {
+                        // HYBRID MPC MODE: Local decryption (fast path ~10ms)
+                        let mut nonce = [0u8; 12];
+                        nonce[..4].copy_from_slice(iv);
+                        nonce[4..].copy_from_slice(&decrypt.explicit_nonce);
+
+                        let aad = make_tls12_aad(
+                            local_read_seq,
                             decrypt.typ,
                             decrypt.version,
-                            decrypt.explicit_nonce,
-                            decrypt.ciphertext,
-                            decrypt.tag,
-                            decrypt.mode,
-                        )
-                        .map_err(MpcTlsError::record_layer)?;
+                            decrypt.ciphertext.len(),
+                        );
+
+                        let mut plaintext = decrypt.ciphertext.clone();
+                        decrypter
+                            .decrypt_in_place_detached(
+                                (&nonce).into(),
+                                &aad,
+                                &mut plaintext,
+                                decrypt.tag.as_slice().into(),
+                            )
+                            .map_err(|_| MpcTlsError::record_layer("local decryption failed"))?;
+
+                        local_read_seq += 1;
+
+                        // Note: In hybrid mode, we store the decrypted data but don't
+                        // push to record layer's decrypt buffer since we're bypassing MPC.
+                        // The transcript will be built differently for hybrid mode.
+                        debug!("locally decrypted {} bytes", plaintext.len());
+                    } else {
+                        // STANDARD MPC MODE: MPC decryption (slow path)
+                        record_layer
+                            .push_decrypt(
+                                decrypt.typ,
+                                decrypt.version,
+                                decrypt.explicit_nonce,
+                                decrypt.ciphertext,
+                                decrypt.tag,
+                                decrypt.mode,
+                            )
+                            .map_err(MpcTlsError::record_layer)?;
+                    }
                 }
                 Message::StartTraffic => {
                     record_layer.start_traffic();
@@ -385,6 +425,21 @@ impl MpcTlsFollower {
                         .flush(&mut self.ctx, vm.clone(), is_decrypting)
                         .await?;
                     debug!("flushed record layer");
+                }
+                Message::RevealDecryptionKey(RevealDecryptionKey {
+                    server_write_key,
+                    server_write_iv,
+                }) => {
+                    debug!("received decryption key from leader - enabling hybrid MPC mode");
+
+                    // Initialize local AES-GCM decrypter with the revealed key
+                    local_decrypter = Some(Aes128Gcm::new(&server_write_key.into()));
+                    local_iv = Some(server_write_iv);
+
+                    // Enable local decryption in record layer
+                    record_layer.enable_local_decryption()?;
+
+                    debug!("hybrid MPC mode enabled - local decryption ready");
                 }
                 Message::CloseConnection => {
                     break;

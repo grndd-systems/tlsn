@@ -53,6 +53,17 @@ impl MpcTlsLeaderCtrl {
 
         Ok(())
     }
+
+    /// Reveals the decryption key to the follower for hybrid MPC mode.
+    ///
+    /// After calling this, the follower will be able to decrypt server
+    /// responses locally without MPC overhead.
+    pub async fn reveal_decryption_key(&self) -> Result<(), MpcTlsError> {
+        self.address
+            .send(RevealDecryptionKey)
+            .await
+            .map_err(MpcTlsError::actor)?
+    }
 }
 
 impl std::fmt::Debug for MpcTlsLeaderCtrl {
@@ -271,6 +282,12 @@ impl Dispatch<MpcTlsLeader> for MpcTlsLeaderMsg {
             MpcTlsLeaderMsg::Stop(msg) => {
                 msg.dispatch(actor, ctx, |value| ret(Self::Return::Stop(value)))
                     .await;
+            }
+            MpcTlsLeaderMsg::RevealDecryptionKey(msg) => {
+                msg.dispatch(actor, ctx, |value| {
+                    ret(Self::Return::RevealDecryptionKey(value))
+                })
+                .await;
             }
         }
     }
@@ -1054,6 +1071,7 @@ pub enum MpcTlsLeaderMsg {
     BackendMsgServerClosed(BackendMsgServerClosed),
     DeferDecryption(EnableDecryption),
     Stop(Stop),
+    RevealDecryptionKey(RevealDecryptionKey),
 }
 
 impl Message for MpcTlsLeaderMsg {
@@ -1089,6 +1107,7 @@ pub enum MpcTlsLeaderMsgReturn {
     BackendMsgServerClosed(<BackendMsgServerClosed as Message>::Return),
     DeferDecryption(<EnableDecryption as Message>::Return),
     Stop(<Stop as Message>::Return),
+    RevealDecryptionKey(<RevealDecryptionKey as Message>::Return),
 }
 
 #[allow(missing_docs)]
@@ -1781,5 +1800,49 @@ impl Wrap<Stop> for MpcTlsLeaderMsg {
             Self::Return::Stop(value) => Ok(value),
             _ => Err(Error::Wrapper),
         }
+    }
+}
+
+/// Message to reveal the decryption key to the follower for hybrid MPC mode.
+#[derive(Debug)]
+pub struct RevealDecryptionKey;
+
+impl Message for RevealDecryptionKey {
+    type Return = Result<(), MpcTlsError>;
+}
+
+impl From<RevealDecryptionKey> for MpcTlsLeaderMsg {
+    fn from(value: RevealDecryptionKey) -> Self {
+        MpcTlsLeaderMsg::RevealDecryptionKey(value)
+    }
+}
+
+impl Wrap<RevealDecryptionKey> for MpcTlsLeaderMsg {
+    fn unwrap_return(ret: Self::Return) -> Result<<RevealDecryptionKey as Message>::Return, Error> {
+        match ret {
+            Self::Return::RevealDecryptionKey(value) => Ok(value),
+            _ => Err(Error::Wrapper),
+        }
+    }
+}
+
+impl Dispatch<MpcTlsLeader> for RevealDecryptionKey {
+    fn dispatch<R: FnOnce(Self::Return) + Send>(
+        self,
+        actor: &mut MpcTlsLeader,
+        ctx: &mut LudiCtx<MpcTlsLeader>,
+        ret: R,
+    ) -> impl Future<Output = ()> + Send {
+        actor.process(self, ctx, ret)
+    }
+}
+
+impl Handler<RevealDecryptionKey> for MpcTlsLeader {
+    async fn handle(
+        &mut self,
+        _msg: RevealDecryptionKey,
+        _ctx: &mut LudiCtx<Self>,
+    ) -> <RevealDecryptionKey as Message>::Return {
+        self.reveal_decryption_key().await
     }
 }
