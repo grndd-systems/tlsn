@@ -1,3 +1,5 @@
+pub mod tiktok;
+
 use std::fmt;
 
 // Maximum number of bytes that can be sent from prover to server.

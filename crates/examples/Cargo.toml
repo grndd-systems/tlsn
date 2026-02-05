@@ -67,3 +67,7 @@ path = "attestation/verify.rs"
 [[example]]
 name = "tiktok_comments"
 path = "tiktok_comments/tiktok_comments.rs"
+
+[[example]]
+name = "tiktok_mentions"
+path = "tiktok_mentions/tiktok_mentions.rs"
