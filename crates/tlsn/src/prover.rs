@@ -26,6 +26,7 @@ use crate::{
 
 use futures::{AsyncRead, AsyncWrite, ready};
 use mpz_common::Context;
+use mpz_memory_core::MemoryExt;
 use mpz_vm_core::Execute;
 use serio::{SinkExt, stream::IoStreamExt};
 use std::{fmt::Debug, marker::PhantomData, pin::Pin, task::Poll};
@@ -371,6 +372,22 @@ where
 
         debug!("verified tags from server");
 
+        // Read the server-side AES-GCM connection secrets locally from the
+        // prover's data store. `vm.get()` reads the bit values that the ZK
+        // VM placed in the prover's local store after circuit execution
+        // (see mpz `ProverStore::set_output_macs` — bit values are
+        // extracted from MAC pointer LSBs into `data_store`). This is
+        // asymmetric: the verifier's store does not populate `data_store`
+        // for circuit outputs, so the verifier never learns these bytes.
+        // Hence proxy mode preserves "the verifier never sees plaintext"
+        // and MPC mode preserves selective disclosure on the verifier side.
+        let server_write_key = vm
+            .get(keys.server_write_key)
+            .map_err(|err| Error::internal().with_source(err))?;
+        let server_write_iv = vm
+            .get(keys.server_write_iv)
+            .map_err(|err| Error::internal().with_source(err))?;
+
         let transcript = tls_transcript.to_transcript().map_err(|e| {
             Error::internal()
                 .with_msg("prover could not create transcript")
@@ -388,6 +405,8 @@ where
                 keys,
                 tls_transcript,
                 transcript,
+                server_write_key,
+                server_write_iv,
             },
         };
 
@@ -505,6 +524,29 @@ impl Prover<state::Committed> {
     /// Returns the transcript.
     pub fn transcript(&self) -> &Transcript {
         &self.state.transcript
+    }
+
+    /// Returns the server-side AES-GCM write key for this session, when
+    /// available.
+    ///
+    /// Read from the prover's local ZK data store after circuit execution —
+    /// the verifier never participates in this read, so it does not learn
+    /// the bytes. Available in both MPC and proxy commit modes once the
+    /// transcript has been committed (TLS 1.2 AES-GCM-128). `None` when the
+    /// underlying VM did not populate the value (e.g. unsupported cipher
+    /// suite).
+    pub fn server_write_key(&self) -> Option<[u8; 16]> {
+        self.state.server_write_key
+    }
+
+    /// Returns the 4-byte implicit nonce prefix (IV) used by the server side
+    /// of this AES-GCM session, when available.
+    ///
+    /// Read locally on the prover side. The implicit nonce prefix is
+    /// observable on the wire so exposing it leaks no additional information
+    /// beyond what the ciphertext already carries.
+    pub fn server_write_iv(&self) -> Option<[u8; 4]> {
+        self.state.server_write_iv
     }
 
     /// Proves information to the verifier.

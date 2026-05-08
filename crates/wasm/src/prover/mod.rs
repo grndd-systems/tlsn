@@ -126,6 +126,29 @@ impl JsProver {
         Ok(convert_transcript(core_transcript))
     }
 
+    /// Returns the server-side AES-GCM write key (16 bytes) for the committed
+    /// session. Read locally on the prover side; the verifier never learns
+    /// these bytes. `null` when the cipher suite is unsupported.
+    #[wasm_bindgen(js_name = serverWriteKey)]
+    pub fn server_write_key(&self) -> Result<Option<Vec<u8>>> {
+        let key = self
+            .inner
+            .server_write_key()
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(key.map(|k| k.to_vec()))
+    }
+
+    /// Returns the server-side AES-GCM implicit IV (4 bytes) for the committed
+    /// session.
+    #[wasm_bindgen(js_name = serverWriteIv)]
+    pub fn server_write_iv(&self) -> Result<Option<Vec<u8>>> {
+        let iv = self
+            .inner
+            .server_write_iv()
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(iv.map(|i| i.to_vec()))
+    }
+
     /// Reveals data to the verifier and finalizes the protocol.
     ///
     /// Optionally accepts a `Commit` object with ranges to hash-commit.

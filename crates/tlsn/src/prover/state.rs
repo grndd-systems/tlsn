@@ -59,6 +59,13 @@ pub struct Committed {
     pub(crate) keys: SessionKeys,
     pub(crate) tls_transcript: TlsTranscript,
     pub(crate) transcript: Transcript,
+    /// Server-side AES-GCM write key, read from the prover's local ZK data
+    /// store after transcript commitment. `Some(_)` when the underlying VM
+    /// populated the value (TLS 1.2 AES-128-GCM); `None` otherwise.
+    pub(crate) server_write_key: Option<[u8; 16]>,
+    /// Server-side AES-GCM IV (4-byte implicit nonce prefix), read locally
+    /// on the prover side after transcript commitment.
+    pub(crate) server_write_iv: Option<[u8; 4]>,
 }
 
 opaque_debug::implement!(Committed);

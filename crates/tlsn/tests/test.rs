@@ -162,3 +162,240 @@ async fn test_proxy() {
         0..10
     );
 }
+
+use aes_gcm::{
+    Aes128Gcm,
+    aead::{Aead, NewAead, Payload, generic_array::GenericArray},
+};
+use tlsn::transcript::{ContentType, Record, TlsTranscript};
+
+/// AES-128-GCM decrypt of a single TLS 1.2 application data record using the
+/// prover's locally-read `server_write_key` + `server_write_iv`. Reconstructs
+/// the GCM nonce (`implicit_iv || explicit_nonce`, 12 bytes) and the TLS 1.2
+/// AEAD additional data (`seq || type || version || cipher_len`, 13 bytes)
+/// per RFC 5246/5288, then verifies the resulting plaintext matches the
+/// transcript's authoritative plaintext. Catches regressions where the wrong
+/// key handle is wired up.
+fn decrypt_first_app_record(
+    key: [u8; 16],
+    iv: [u8; 4],
+    transcript: &TlsTranscript,
+) -> Vec<u8> {
+    let record: &Record = transcript
+        .recv()
+        .iter()
+        .find(|r| r.typ == ContentType::ApplicationData)
+        .expect("recv transcript should contain at least one application-data record");
+
+    let mut nonce = [0u8; 12];
+    nonce[..4].copy_from_slice(&iv);
+    nonce[4..].copy_from_slice(&record.explicit_nonce);
+
+    let tag = record
+        .tag
+        .as_ref()
+        .expect("application data record should carry a 16-byte GCM tag");
+
+    let mut payload = record.ciphertext.clone();
+    payload.extend_from_slice(tag);
+
+    let mut aad = Vec::with_capacity(13);
+    aad.extend_from_slice(&record.seq.to_be_bytes());
+    aad.push(0x17); // ContentType::ApplicationData
+    aad.push(0x03); // TLS 1.2 major
+    aad.push(0x03); // TLS 1.2 minor
+    aad.extend_from_slice(&(record.ciphertext.len() as u16).to_be_bytes());
+
+    let cipher = Aes128Gcm::new(GenericArray::from_slice(&key));
+    cipher
+        .decrypt(
+            GenericArray::from_slice(&nonce),
+            Payload {
+                msg: &payload,
+                aad: &aad,
+            },
+        )
+        .expect("AES-128-GCM decrypt must succeed with the prover's local key + IV")
+}
+
+/// Verifies that in MPC mode the prover can use the locally-read key + IV to
+/// AES-GCM-decrypt the first received application data record back to the
+/// same plaintext that the transcript authoritatively committed to. The
+/// verifier never participates in this read so it learns nothing extra.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_mpc_session_keys_exposed() {
+    match tracing_subscriber::fmt::try_init() {
+        Ok(_) => info!("set up tracing subscriber"),
+        Err(_) => warn!("tracing subscriber already set up"),
+    };
+
+    const MAX_SENT_DATA: usize = 1 << 12;
+    const MAX_SENT_RECORDS: usize = 4;
+    const MAX_RECV_DATA: usize = 1 << 14;
+    const MAX_RECV_RECORDS: usize = 6;
+
+    let config = MpcTlsConfig::builder()
+        .max_sent_data(MAX_SENT_DATA)
+        .max_sent_records(MAX_SENT_RECORDS)
+        .max_recv_data(MAX_RECV_DATA)
+        .max_recv_records_online(MAX_RECV_RECORDS)
+        .build()
+        .unwrap();
+
+    let (prover_socket, verifier_socket) = tokio::io::duplex(2 << 23);
+    let mut session_p = Session::new(prover_socket.compat());
+    let mut session_v = Session::new(verifier_socket.compat());
+
+    let prover = session_p
+        .new_prover(ProverConfig::builder().build().unwrap())
+        .unwrap();
+    let verifier = session_v
+        .new_verifier(
+            VerifierConfig::builder()
+                .root_store(RootCertStore {
+                    roots: vec![CertificateDer(CA_CERT_DER.to_vec())],
+                })
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+
+    let (session_p_driver, session_p_handle) = session_p.split();
+    let (session_v_driver, session_v_handle) = session_v.split();
+
+    tokio::spawn(session_p_driver);
+    tokio::spawn(session_v_driver);
+
+    let (client_socket, server_socket) = tokio::io::duplex(2 << 16);
+    let server_task = tokio::spawn(bind(server_socket.compat()));
+
+    let prover_fut = async {
+        let prover = run_prover_mpc(config, prover, Some(client_socket)).await;
+        let key = prover
+            .server_write_key()
+            .expect("server_write_key must be available after transcript commit");
+        let iv = prover
+            .server_write_iv()
+            .expect("server_write_iv must be available after transcript commit");
+        let tls_transcript = prover.tls_transcript().clone();
+        finish_prover(prover).await;
+        (key, iv, tls_transcript)
+    };
+
+    let ((key, iv, tls_transcript), _verifier_output) =
+        tokio::join!(prover_fut, run_verifier(verifier, None));
+
+    session_p_handle.close();
+    session_v_handle.close();
+
+    let _ = server_task.await.unwrap();
+
+    assert_ne!(
+        key, [0u8; 16],
+        "MPC: server_write_key must be a real session key, not zeros"
+    );
+    assert_ne!(
+        iv, [0u8; 4],
+        "MPC: server_write_iv must be a real implicit nonce, not zeros"
+    );
+
+    let plaintext = decrypt_first_app_record(key, iv, &tls_transcript);
+    let expected = tls_transcript
+        .recv()
+        .iter()
+        .find(|r| r.typ == ContentType::ApplicationData)
+        .and_then(|r| r.plaintext.as_ref())
+        .expect("first application data record must carry committed plaintext");
+    assert_eq!(
+        &plaintext, expected,
+        "MPC: AES-GCM decrypt with prover's local key/iv must match the transcript's plaintext"
+    );
+}
+
+/// Verifies that in proxy mode the prover can use the locally-read key + IV
+/// to AES-GCM-decrypt the first received application data record back to the
+/// same plaintext as the transcript. The notary (verifier) never sees the
+/// key — proxy mode's "notary cannot decrypt" property is preserved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn test_proxy_session_keys_exposed() {
+    match tracing_subscriber::fmt::try_init() {
+        Ok(_) => info!("set up tracing subscriber"),
+        Err(_) => warn!("tracing subscriber already set up"),
+    };
+
+    let config = ProxyTlsConfig::builder()
+        .server_name(DnsName::try_from(SERVER_DOMAIN).unwrap())
+        .build()
+        .unwrap();
+
+    let (prover_socket, verifier_socket) = tokio::io::duplex(2 << 23);
+    let mut session_p = Session::new(prover_socket.compat());
+    let mut session_v = Session::new(verifier_socket.compat());
+
+    let prover = session_p
+        .new_prover(ProverConfig::builder().build().unwrap())
+        .unwrap();
+    let verifier = session_v
+        .new_verifier(
+            VerifierConfig::builder()
+                .root_store(RootCertStore {
+                    roots: vec![CertificateDer(CA_CERT_DER.to_vec())],
+                })
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+
+    let (session_p_driver, session_p_handle) = session_p.split();
+    let (session_v_driver, session_v_handle) = session_v.split();
+
+    tokio::spawn(session_p_driver);
+    tokio::spawn(session_v_driver);
+
+    let (client_socket, server_socket) = tokio::io::duplex(2 << 16);
+    let server_task = tokio::spawn(bind(server_socket.compat()));
+
+    let prover_fut = async {
+        let prover = run_prover_proxy(config, prover).await;
+        let key = prover
+            .server_write_key()
+            .expect("server_write_key must be available after transcript commit");
+        let iv = prover
+            .server_write_iv()
+            .expect("server_write_iv must be available after transcript commit");
+        let tls_transcript = prover.tls_transcript().clone();
+        finish_prover(prover).await;
+        (key, iv, tls_transcript)
+    };
+
+    let ((key, iv, tls_transcript), _verifier_output) =
+        tokio::join!(prover_fut, run_verifier(verifier, Some(client_socket)));
+
+    session_p_handle.close();
+    session_v_handle.close();
+
+    let _ = server_task.await.unwrap();
+
+    assert_ne!(
+        key, [0u8; 16],
+        "Proxy: server_write_key must be a real session key, not zeros"
+    );
+    assert_ne!(
+        iv, [0u8; 4],
+        "Proxy: server_write_iv must be a real implicit nonce, not zeros"
+    );
+
+    let plaintext = decrypt_first_app_record(key, iv, &tls_transcript);
+    let expected = tls_transcript
+        .recv()
+        .iter()
+        .find(|r| r.typ == ContentType::ApplicationData)
+        .and_then(|r| r.plaintext.as_ref())
+        .expect("first application data record must carry committed plaintext");
+    assert_eq!(
+        &plaintext, expected,
+        "Proxy: AES-GCM decrypt with prover's local key/iv must match the transcript's plaintext"
+    );
+}

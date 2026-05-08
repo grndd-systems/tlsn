@@ -341,6 +341,26 @@ impl SdkProver {
         Ok(Transcript::from(prover.transcript()))
     }
 
+    /// Returns the server-side AES-GCM write key for the committed session.
+    ///
+    /// Read locally from the prover's ZK data store; the verifier never
+    /// learns these bytes. `None` if the cipher suite is unsupported.
+    pub fn server_write_key(&self) -> Result<Option<[u8; 16]>> {
+        let State::Committed { prover, .. } = &self.state else {
+            return Err(SdkError::invalid_state("prover is not in committed state"));
+        };
+        Ok(prover.server_write_key())
+    }
+
+    /// Returns the server-side AES-GCM IV (4-byte implicit nonce prefix) for
+    /// the committed session.
+    pub fn server_write_iv(&self) -> Result<Option<[u8; 4]>> {
+        let State::Committed { prover, .. } = &self.state else {
+            return Err(SdkError::invalid_state("prover is not in committed state"));
+        };
+        Ok(prover.server_write_iv())
+    }
+
     /// Reveals data to the verifier and finalizes the protocol.
     ///
     /// Optionally accepts a [`Commit`] with ranges to hash-commit (blinded,

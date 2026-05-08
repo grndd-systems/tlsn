@@ -7165,6 +7165,7 @@ name = "tlsn"
 version = "0.1.0-alpha.15-pre"
 dependencies = [
  "aes 0.8.4",
+ "aes-gcm",
  "ctr 0.9.2",
  "futures",
  "futures-plex",
