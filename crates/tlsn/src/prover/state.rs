@@ -66,6 +66,10 @@ pub struct Committed {
     /// Server-side AES-GCM IV (4-byte implicit nonce prefix), read locally
     /// on the prover side after transcript commitment.
     pub(crate) server_write_iv: Option<[u8; 4]>,
+    /// Client-side AES-GCM write key (encrypts sent direction).
+    pub(crate) client_write_key: Option<[u8; 16]>,
+    /// Client-side AES-GCM IV (4-byte implicit nonce prefix, sent direction).
+    pub(crate) client_write_iv: Option<[u8; 4]>,
 }
 
 opaque_debug::implement!(Committed);

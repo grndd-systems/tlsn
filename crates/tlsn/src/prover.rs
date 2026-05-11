@@ -387,6 +387,12 @@ where
         let server_write_iv = vm
             .get(keys.server_write_iv)
             .map_err(|err| Error::internal().with_source(err))?;
+        let client_write_key = vm
+            .get(keys.client_write_key)
+            .map_err(|err| Error::internal().with_source(err))?;
+        let client_write_iv = vm
+            .get(keys.client_write_iv)
+            .map_err(|err| Error::internal().with_source(err))?;
 
         let transcript = tls_transcript.to_transcript().map_err(|e| {
             Error::internal()
@@ -407,6 +413,8 @@ where
                 transcript,
                 server_write_key,
                 server_write_iv,
+                client_write_key,
+                client_write_iv,
             },
         };
 
@@ -547,6 +555,19 @@ impl Prover<state::Committed> {
     /// beyond what the ciphertext already carries.
     pub fn server_write_iv(&self) -> Option<[u8; 4]> {
         self.state.server_write_iv
+    }
+
+    /// Returns the client-side AES-GCM write key (encrypts sent direction),
+    /// when available. Same asymmetric `vm.get()` semantics as
+    /// [`Prover::server_write_key`] — only the prover learns it.
+    pub fn client_write_key(&self) -> Option<[u8; 16]> {
+        self.state.client_write_key
+    }
+
+    /// Returns the 4-byte implicit nonce prefix (IV) used by the client side
+    /// of this AES-GCM session, when available.
+    pub fn client_write_iv(&self) -> Option<[u8; 4]> {
+        self.state.client_write_iv
     }
 
     /// Proves information to the verifier.

@@ -149,6 +149,28 @@ impl JsProver {
         Ok(iv.map(|i| i.to_vec()))
     }
 
+    /// Returns the client-side AES-GCM write key (16 bytes), which encrypts
+    /// the sent direction. Same asymmetric semantics as `serverWriteKey`.
+    #[wasm_bindgen(js_name = clientWriteKey)]
+    pub fn client_write_key(&self) -> Result<Option<Vec<u8>>> {
+        let key = self
+            .inner
+            .client_write_key()
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(key.map(|k| k.to_vec()))
+    }
+
+    /// Returns the client-side AES-GCM implicit IV (4 bytes) for the sent
+    /// direction.
+    #[wasm_bindgen(js_name = clientWriteIv)]
+    pub fn client_write_iv(&self) -> Result<Option<Vec<u8>>> {
+        let iv = self
+            .inner
+            .client_write_iv()
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(iv.map(|i| i.to_vec()))
+    }
+
     /// Reveals data to the verifier and finalizes the protocol.
     ///
     /// Optionally accepts a `Commit` object with ranges to hash-commit.

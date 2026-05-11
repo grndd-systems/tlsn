@@ -167,25 +167,20 @@ use aes_gcm::{
     Aes128Gcm,
     aead::{Aead, NewAead, Payload, generic_array::GenericArray},
 };
-use tlsn::transcript::{ContentType, Record, TlsTranscript};
+use tlsn::transcript::{ContentType, Record};
 
 /// AES-128-GCM decrypt of a single TLS 1.2 application data record using the
-/// prover's locally-read `server_write_key` + `server_write_iv`. Reconstructs
-/// the GCM nonce (`implicit_iv || explicit_nonce`, 12 bytes) and the TLS 1.2
-/// AEAD additional data (`seq || type || version || cipher_len`, 13 bytes)
-/// per RFC 5246/5288, then verifies the resulting plaintext matches the
-/// transcript's authoritative plaintext. Catches regressions where the wrong
-/// key handle is wired up.
-fn decrypt_first_app_record(
-    key: [u8; 16],
-    iv: [u8; 4],
-    transcript: &TlsTranscript,
-) -> Vec<u8> {
-    let record: &Record = transcript
-        .recv()
+/// prover's locally-read key + IV. Reconstructs the GCM nonce
+/// (`implicit_iv || explicit_nonce`, 12 bytes) and the TLS 1.2 AEAD AAD
+/// (`seq || type || version || cipher_len`, 13 bytes) per RFC 5246/5288, then
+/// verifies the resulting plaintext matches the transcript's authoritative
+/// plaintext. `records` is either `transcript.recv()` (for server_write_key)
+/// or `transcript.sent()` (for client_write_key).
+fn decrypt_first_app_record_from(key: [u8; 16], iv: [u8; 4], records: &[Record]) -> Vec<u8> {
+    let record: &Record = records
         .iter()
         .find(|r| r.typ == ContentType::ApplicationData)
-        .expect("recv transcript should contain at least one application-data record");
+        .expect("transcript should contain at least one application-data record");
 
     let mut nonce = [0u8; 12];
     nonce[..4].copy_from_slice(&iv);
@@ -272,18 +267,24 @@ async fn test_mpc_session_keys_exposed() {
 
     let prover_fut = async {
         let prover = run_prover_mpc(config, prover, Some(client_socket)).await;
-        let key = prover
+        let server_key = prover
             .server_write_key()
             .expect("server_write_key must be available after transcript commit");
-        let iv = prover
+        let server_iv = prover
             .server_write_iv()
             .expect("server_write_iv must be available after transcript commit");
+        let client_key = prover
+            .client_write_key()
+            .expect("client_write_key must be available after transcript commit");
+        let client_iv = prover
+            .client_write_iv()
+            .expect("client_write_iv must be available after transcript commit");
         let tls_transcript = prover.tls_transcript().clone();
         finish_prover(prover).await;
-        (key, iv, tls_transcript)
+        (server_key, server_iv, client_key, client_iv, tls_transcript)
     };
 
-    let ((key, iv, tls_transcript), _verifier_output) =
+    let ((server_key, server_iv, client_key, client_iv, tls_transcript), _verifier_output) =
         tokio::join!(prover_fut, run_verifier(verifier, None));
 
     session_p_handle.close();
@@ -292,24 +293,52 @@ async fn test_mpc_session_keys_exposed() {
     let _ = server_task.await.unwrap();
 
     assert_ne!(
-        key, [0u8; 16],
+        server_key, [0u8; 16],
         "MPC: server_write_key must be a real session key, not zeros"
     );
     assert_ne!(
-        iv, [0u8; 4],
+        server_iv, [0u8; 4],
         "MPC: server_write_iv must be a real implicit nonce, not zeros"
     );
+    assert_ne!(
+        client_key, [0u8; 16],
+        "MPC: client_write_key must be a real session key, not zeros"
+    );
+    assert_ne!(
+        client_iv, [0u8; 4],
+        "MPC: client_write_iv must be a real implicit nonce, not zeros"
+    );
+    assert_ne!(
+        server_key, client_key,
+        "MPC: client and server write keys must differ"
+    );
 
-    let plaintext = decrypt_first_app_record(key, iv, &tls_transcript);
-    let expected = tls_transcript
+    // Server side: decrypt first recv record with server_write_key.
+    let recv_plaintext =
+        decrypt_first_app_record_from(server_key, server_iv, tls_transcript.recv());
+    let expected_recv = tls_transcript
         .recv()
         .iter()
         .find(|r| r.typ == ContentType::ApplicationData)
         .and_then(|r| r.plaintext.as_ref())
-        .expect("first application data record must carry committed plaintext");
+        .expect("first recv application data record must carry committed plaintext");
     assert_eq!(
-        &plaintext, expected,
-        "MPC: AES-GCM decrypt with prover's local key/iv must match the transcript's plaintext"
+        &recv_plaintext, expected_recv,
+        "MPC: AES-GCM decrypt with server_write_key must match recv plaintext"
+    );
+
+    // Client side: decrypt first sent record with client_write_key.
+    let sent_plaintext =
+        decrypt_first_app_record_from(client_key, client_iv, tls_transcript.sent());
+    let expected_sent = tls_transcript
+        .sent()
+        .iter()
+        .find(|r| r.typ == ContentType::ApplicationData)
+        .and_then(|r| r.plaintext.as_ref())
+        .expect("first sent application data record must carry committed plaintext");
+    assert_eq!(
+        &sent_plaintext, expected_sent,
+        "MPC: AES-GCM decrypt with client_write_key must match sent plaintext"
     );
 }
 
@@ -359,18 +388,24 @@ async fn test_proxy_session_keys_exposed() {
 
     let prover_fut = async {
         let prover = run_prover_proxy(config, prover).await;
-        let key = prover
+        let server_key = prover
             .server_write_key()
             .expect("server_write_key must be available after transcript commit");
-        let iv = prover
+        let server_iv = prover
             .server_write_iv()
             .expect("server_write_iv must be available after transcript commit");
+        let client_key = prover
+            .client_write_key()
+            .expect("client_write_key must be available after transcript commit");
+        let client_iv = prover
+            .client_write_iv()
+            .expect("client_write_iv must be available after transcript commit");
         let tls_transcript = prover.tls_transcript().clone();
         finish_prover(prover).await;
-        (key, iv, tls_transcript)
+        (server_key, server_iv, client_key, client_iv, tls_transcript)
     };
 
-    let ((key, iv, tls_transcript), _verifier_output) =
+    let ((server_key, server_iv, client_key, client_iv, tls_transcript), _verifier_output) =
         tokio::join!(prover_fut, run_verifier(verifier, Some(client_socket)));
 
     session_p_handle.close();
@@ -379,23 +414,49 @@ async fn test_proxy_session_keys_exposed() {
     let _ = server_task.await.unwrap();
 
     assert_ne!(
-        key, [0u8; 16],
+        server_key, [0u8; 16],
         "Proxy: server_write_key must be a real session key, not zeros"
     );
     assert_ne!(
-        iv, [0u8; 4],
+        server_iv, [0u8; 4],
         "Proxy: server_write_iv must be a real implicit nonce, not zeros"
     );
+    assert_ne!(
+        client_key, [0u8; 16],
+        "Proxy: client_write_key must be a real session key, not zeros"
+    );
+    assert_ne!(
+        client_iv, [0u8; 4],
+        "Proxy: client_write_iv must be a real implicit nonce, not zeros"
+    );
+    assert_ne!(
+        server_key, client_key,
+        "Proxy: client and server write keys must differ"
+    );
 
-    let plaintext = decrypt_first_app_record(key, iv, &tls_transcript);
-    let expected = tls_transcript
+    let recv_plaintext =
+        decrypt_first_app_record_from(server_key, server_iv, tls_transcript.recv());
+    let expected_recv = tls_transcript
         .recv()
         .iter()
         .find(|r| r.typ == ContentType::ApplicationData)
         .and_then(|r| r.plaintext.as_ref())
-        .expect("first application data record must carry committed plaintext");
+        .expect("first recv application data record must carry committed plaintext");
     assert_eq!(
-        &plaintext, expected,
-        "Proxy: AES-GCM decrypt with prover's local key/iv must match the transcript's plaintext"
+        &recv_plaintext, expected_recv,
+        "Proxy: AES-GCM decrypt with server_write_key must match recv plaintext"
+    );
+
+    let sent_plaintext =
+        decrypt_first_app_record_from(client_key, client_iv, tls_transcript.sent());
+    let expected_sent = tls_transcript
+        .sent()
+        .iter()
+        .find(|r| r.typ == ContentType::ApplicationData)
+        .and_then(|r| r.plaintext.as_ref())
+        .expect("first sent application data record must carry committed plaintext");
+    assert_eq!(
+        &sent_plaintext, expected_sent,
+        "Proxy: AES-GCM decrypt with client_write_key must match sent plaintext"
     );
 }
