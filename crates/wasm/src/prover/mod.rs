@@ -266,6 +266,7 @@ fn convert_http_request(request: HttpRequest) -> tlsn_sdk_core::HttpRequest {
     if let Some(body) = request.body {
         let core_body = match body {
             Body::Json(value) => tlsn_sdk_core::Body::Json(value),
+            Body::Raw(bytes) => tlsn_sdk_core::Body::Raw(bytes),
         };
         core_request = core_request.body(core_body);
     }

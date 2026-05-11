@@ -14,6 +14,8 @@ use tsify_next::Tsify;
 pub enum Body {
     /// JSON body.
     Json(JsonValue),
+    /// Raw bytes (e.g. `application/x-www-form-urlencoded`).
+    Raw(Vec<u8>),
 }
 
 /// HTTP method.
